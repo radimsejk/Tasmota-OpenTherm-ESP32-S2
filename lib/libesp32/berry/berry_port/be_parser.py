@@ -79,6 +79,7 @@ from berry_port.berry_conf import (
     BE_USE_SCRIPT_COMPILER,
     BE_DEBUG_RUNTIME_INFO, BE_DEBUG_VAR_INFO,
     BE_INTGER_TYPE,
+    BE_MAX_PARSER_DEPTH,
 )
 
 
@@ -346,11 +347,14 @@ def _clone_expdesc(src):
 #     int breaklist;
 #     int beginpc;
 #     int continuelist;
+# #if BE_DEBUG_VAR_INFO
+#     int nvarinfo;
+# #endif
 # } bblockinfo;
 class bblockinfo:
     """Block information — mirrors C bblockinfo struct."""
     __slots__ = ('prev', 'nactlocals', 'type', 'hasupval', 'sideeffect',
-                 'lastjmp', 'breaklist', 'beginpc', 'continuelist')
+                 'lastjmp', 'breaklist', 'beginpc', 'continuelist', 'nvarinfo')
 
     def __init__(self):
         self.prev = None
@@ -362,6 +366,7 @@ class bblockinfo:
         self.breaklist = NO_JUMP
         self.beginpc = 0
         self.continuelist = NO_JUMP
+        self.nvarinfo = 0
 
 
 # ============================================================================
@@ -417,10 +422,11 @@ class bfuncinfo:
 #     bfuncinfo *finfo;
 #     bclosure *cl;
 #     bbyte islocal;
+#     bbyte depth;  /* recursion depth for expr/block; bounded by BE_MAX_PARSER_DEPTH (must fit in bbyte) */
 # } bparser;
 class bparser:
     """Parser state — mirrors C bparser struct."""
-    __slots__ = ('lexer', 'vm', 'finfo', 'cl', 'islocal')
+    __slots__ = ('lexer', 'vm', 'finfo', 'cl', 'islocal', 'depth')
 
     def __init__(self):
         self.lexer = blexer()
@@ -428,6 +434,32 @@ class bparser:
         self.finfo = None
         self.cl = None
         self.islocal = 0
+        self.depth = 0
+
+
+# /* BE_MAX_PARSER_DEPTH is defined in berry_conf.h as a hard limit to keep
+#  * pathological source from overflowing the C stack. Each level of nesting
+#  * in expr/sub_expr/block costs ~hundreds of bytes of native stack, so the
+#  * default 200 leaves comfortable headroom on small targets.
+#  * Stored in a bbyte, so values above 255 are clamped. */
+
+
+# #define enter_recursion(parser) do { \
+#     if (++(parser)->depth > BE_MAX_PARSER_DEPTH) { \
+#         push_error((parser), "expression or block too deeply nested"); \
+#     } \
+# } while (0)
+def enter_recursion(parser):
+    """Increment recursion depth and error out if too deep."""
+    parser.depth += 1
+    if parser.depth > BE_MAX_PARSER_DEPTH:
+        push_error(parser, "expression or block too deeply nested")
+
+
+# #define leave_recursion(parser)  (--(parser)->depth)
+def leave_recursion(parser):
+    """Decrement recursion depth."""
+    parser.depth -= 1
 
 
 # ============================================================================
@@ -508,8 +540,8 @@ def be_code_freeregs(finfo, n):
     # #define be_code_freeregs(f, n)  ((f)->freereg -= (bbyte)(n))
     finfo.freereg -= n
 
-def be_code_prebinop(finfo, op, e):
-    return _lazy_be_code().be_code_prebinop(finfo, op, e)
+def be_code_prebinop(finfo, op, e, dst):
+    return _lazy_be_code().be_code_prebinop(finfo, op, e, dst)
 
 def be_code_binop(finfo, op, e1, e2, dst):
     return _lazy_be_code().be_code_binop(finfo, op, e1, e2, dst)
@@ -787,31 +819,37 @@ if BE_DEBUG_VAR_INFO:
             vi.name = name
             vi.beginpc = finfo.pc
             vi.endpc = 0
-            finfo.varvec.data[-1] = vi
+            finfo.varvec.data[finfo.varvec.end] = vi
         finfo.proto.varinfo = be_vector_data(finfo.varvec)
         finfo.proto.nvarinfo = be_vector_capacity(finfo.varvec)
 
-    # void end_varinfo(bparser *parser, int beginpc)
-    def end_varinfo(parser, beginpc):
+    # void end_varinfo(bparser *parser)
+    # {
+    #     bfuncinfo *finfo = parser->finfo;
+    #     bvarinfo *var = be_vector_data(&finfo->varvec);
+    #     int i, count = be_vector_count(&finfo->varvec);
+    #     /* skip the variables of the previous blocks: a variable declared just
+    #      * before the block can have the same beginpc as the block itself */
+    #     for (i = finfo->binfo->nvarinfo; i < count; ++i) {
+    #         if (!var[i].endpc)
+    #             var[i].endpc = finfo->pc;
+    #     }
+    # }
+    def end_varinfo(parser):
         finfo = parser.finfo
-        binfo = finfo.binfo
-        if beginpc == -1:
-            beginpc = binfo.beginpc
         data = be_vector_data(finfo.varvec)
         if data is None:
             return
-        for it in data:
-            if it is None:
-                continue
-            if it.beginpc < beginpc:
-                continue
-            if not it.endpc:
-                it.endpc = finfo.pc
+        count = be_vector_count(finfo.varvec)
+        for i in range(finfo.binfo.nvarinfo, count):
+            var = data[i]
+            if var is not None and not var.endpc:
+                var.endpc = finfo.pc
 else:
     def begin_varinfo(parser, name):
         pass
 
-    def end_varinfo(parser, beginpc):
+    def end_varinfo(parser):
         pass
 
 
@@ -829,6 +867,9 @@ else:
 #     binfo->lastjmp = 0;
 #     binfo->beginpc = finfo->pc;
 #     binfo->nactlocals = (bbyte)be_list_count(finfo->local);
+# #if BE_DEBUG_VAR_INFO
+#     binfo->nvarinfo = be_vector_count(&finfo->varvec);
+# #endif
 #     if (type & BLOCK_LOOP) {
 #         binfo->breaklist = NO_JUMP;
 #         binfo->continuelist = NO_JUMP;
@@ -844,12 +885,14 @@ def begin_block(finfo, binfo, type_):
     binfo.lastjmp = 0
     binfo.beginpc = finfo.pc
     binfo.nactlocals = be_list_count(finfo.local)
+    if BE_DEBUG_VAR_INFO:
+        binfo.nvarinfo = be_vector_count(finfo.varvec)
     if type_ & BLOCK_LOOP:
         binfo.breaklist = NO_JUMP
         binfo.continuelist = NO_JUMP
 
 
-# static void end_block_ex(bparser *parser, int beginpc)
+# static void end_block(bparser *parser)
 # {
 #     bfuncinfo *finfo = parser->finfo;
 #     bblockinfo *binfo = finfo->binfo;
@@ -859,12 +902,12 @@ def begin_block(finfo, binfo, type_):
 #         be_code_patchjump(finfo, binfo->breaklist);
 #         be_code_patchlist(finfo, binfo->continuelist, binfo->beginpc);
 #     }
-#     end_varinfo(parser, beginpc);
+#     end_varinfo(parser);
 #     be_list_resize(parser->vm, finfo->local, binfo->nactlocals);
 #     finfo->freereg = binfo->nactlocals;
 #     finfo->binfo = binfo->prev;
 # }
-def end_block_ex(parser, beginpc):
+def end_block(parser):
     """End a block, closing upvalues and patching jumps."""
     finfo = parser.finfo
     binfo = finfo.binfo
@@ -873,19 +916,10 @@ def end_block_ex(parser, beginpc):
         be_code_jumpto(finfo, binfo.beginpc)
         be_code_patchjump(finfo, binfo.breaklist)
         be_code_patchlist(finfo, binfo.continuelist, binfo.beginpc)
-    end_varinfo(parser, beginpc)
+    end_varinfo(parser)
     be_list_resize(parser.vm, finfo.local, binfo.nactlocals)
     finfo.freereg = binfo.nactlocals
     finfo.binfo = binfo.prev
-
-
-# static void end_block(bparser *parser)
-# {
-#     end_block_ex(parser, -1);
-# }
-def end_block(parser):
-    """End a block using default beginpc."""
-    end_block_ex(parser, -1)
 
 
 # ============================================================================
@@ -1646,18 +1680,24 @@ def suffix_alloc_reg(parser, l):
 def compound_assign(parser, op, l, r):
     """Handle compound assignment (+=, -=, etc.)."""
     dst = -1
+    e = None
     if op != OptAssign:
         check_var(parser, l)
         dst = parser.finfo.freereg
         suffix_alloc_reg(parser, l)
-    expr(parser, r)
-    check_var(parser, r)
-    if op != OptAssign:
         e = _clone_expdesc(l)
         if op < OptAndAssign:
             op = op - OptAddAssign + OptAdd
         else:
             op = op - OptAndAssign + OptBitAnd
+        # Materialize the left operand here, before the right one is parsed,
+        # the way sub_expr() does it through be_code_prebinop(). Otherwise the
+        # code that loads it is emitted from binaryexp() below, by then the
+        # right side has opened its jump list, and the load lands inside it.
+        be_code_prebinop(parser.finfo, op, e, dst)
+    expr(parser, r)
+    check_var(parser, r)
+    if op != OptAssign:
         be_code_binop(parser.finfo, op, e, r, dst)
         _copy_expdesc(r, e)
 
@@ -1752,6 +1792,7 @@ def cond_expr(parser, e):
 def sub_expr(parser, e, prio):
     """Parse a sub-expression with operator precedence."""
     finfo = parser.finfo
+    enter_recursion(parser)
     op = get_unary_op(parser)
     if op != OP_NOT_UNARY:
         scan_next_token(parser)
@@ -1771,7 +1812,7 @@ def sub_expr(parser, e, prio):
         e2 = bexpdesc()
         check_var(parser, e)
         scan_next_token(parser)
-        be_code_prebinop(finfo, op, e)
+        be_code_prebinop(finfo, op, e, -1)  # and or
         if op == OptConnect:
             parser.finfo.binfo.sideeffect = 1
         init_exp(e2, ETVOID, 0)
@@ -1785,6 +1826,7 @@ def sub_expr(parser, e, prio):
 
     if prio == ASSIGN_OP_PRIO:
         cond_expr(parser, e)
+    leave_recursion(parser)
 
 
 # static void walrus_expr(bparser *parser, bexpdesc *e)
@@ -1794,17 +1836,34 @@ def walrus_expr(parser, e):
     sub_expr(parser, e, ASSIGN_OP_PRIO)
     op = next_type(parser)
     if op == OptWalrus:
+        finfo = parser.finfo
         check_symbol(parser, e)
+        # ':=' only assigns an existing variable, it never creates one (neither
+        # local nor global, nor a local shadowing a builtin). A new local would
+        # take the register right above the other locals, which may still hold
+        # a temporary of the enclosing expression, and an implicit global is an
+        # easy way to hide a typo.
+        if e.type == ETVOID or \
+                (e.type == ETGLOBAL and e.v.idx < be_builtin_count(parser.vm)):
+            name = e.v.s if e.type == ETVOID else be_builtin_name(parser.vm, e.v.idx)
+            parser.lexer.linenumber = line
+            push_error(parser,
+                "cannot create variable '%s' with ':=', "
+                "declare it with 'var' first", be_str2cstr(name))
         e1 = _clone_expdesc(e)
         parser.finfo.binfo.sideeffect = 1
         scan_next_token(parser)  # skip ':='
+        base = finfo.freereg  # registers below are still in use by the enclosing expression
         expr(parser, e)
         check_var(parser, e)
-        if check_newvar(parser, e1):
-            new_var(parser, e1.v.s, e1)
         if be_code_setvar(parser.finfo, e1, e, True):
             parser.lexer.linenumber = line
             parser_error(parser, "try to assign constant expressions.")
+        if e1.type == ETLOCAL and e.type == ETLOCAL and finfo.freereg > base:
+            # the value is now held by the local variable: release the temporary
+            # registers used by the right side, e.g. the object of `l[i]`.
+            # `:=` never creates a local, so `base` is never below the locals
+            finfo.freereg = base
 
 
 # static void expr(bparser *parser, bexpdesc *e)
@@ -1938,15 +1997,15 @@ def for_iter(parser, var, it):
     stmtlist(parser)
 
 
-# static void for_leave(bparser *parser, int jcatch, int beginpc)
-def for_leave(parser, jcatch, beginpc):
+# static void for_leave(bparser *parser, int jcatch)
+def for_leave(parser, jcatch):
     """Emit the for loop exit code with stop_iteration exception handling."""
     e = bexpdesc()
     finfo = parser.finfo
     jbrk = finfo.binfo.breaklist
     init_exp(e, ETSTRING, 0)
     e.v.s = parser_newstr(parser, "stop_iteration")
-    end_block_ex(parser, beginpc)
+    end_block(parser)
     if jbrk != NO_JUMP:
         be_code_exblk(finfo, 1)
         jbrk = be_code_jump(finfo)
@@ -1964,7 +2023,6 @@ def for_leave(parser, jcatch, beginpc):
 def for_stmt(parser):
     """Parse a for loop: for ID : expr block end."""
     finfo = parser.finfo
-    beginpc = finfo.pc
     scan_next_token(parser)  # skip 'for'
     binfo = bblockinfo()
     begin_block(finfo, binfo, BLOCK_EXCEPT | BLOCK_LOOP)
@@ -1974,7 +2032,7 @@ def for_stmt(parser):
     for_init(parser, iter_)
     jcatch = be_code_exblk(finfo, 0)
     for_iter(parser, var, iter_)
-    for_leave(parser, jcatch, beginpc)
+    for_leave(parser, jcatch)
     match_token(parser, KeyEnd)
 
 
@@ -2470,9 +2528,11 @@ def stmtlist(parser):
 def block(parser, type_):
     """Parse a block: begin_block, stmtlist, end_block."""
     binfo = bblockinfo()
+    enter_recursion(parser)
     begin_block(parser.finfo, binfo, type_)
     stmtlist(parser)
     end_block(parser)
+    leave_recursion(parser)
 
 
 # ============================================================================
@@ -2539,18 +2599,34 @@ def be_parser_source(vm, fname, reader, data, islocal):
     parser.finfo = None
     parser.cl = cl
     parser.islocal = 1 if islocal else 0
+    parser.depth = 0
 
-    # Push closure on stack for GC protection
-    if vm.top_idx >= len(vm.stack):
-        vm.stack.append(bvalue())
-    var_setclosure(vm.stack[vm.top_idx], cl)
-    be_stackpush(vm)
+    # The Python port bounces through ~7–10 frames per parser level
+    # (expr → walrus_expr → sub_expr → suffix_expr → primary_expr → expr …),
+    # so BE_MAX_PARSER_DEPTH=200 needs a comfortable Python frame budget.
+    # The C port uses its own depth counter (not the OS stack) to reject
+    # pathological input; we mirror that but still need to keep Python's
+    # recursion limit above our bound so our error fires first.
+    _prev_recursion_limit = sys.getrecursionlimit()
+    _needed = BE_MAX_PARSER_DEPTH * 20 + 500  # 10x safety factor
+    if _prev_recursion_limit < _needed:
+        sys.setrecursionlimit(_needed)
 
-    be_lexer_init(parser.lexer, vm, fname, reader, data)
-    scan_next_token(parser)  # scan first token
-    mainfunc(parser, cl)
-    be_lexer_deinit(parser.lexer)
-    be_global_release_space(vm)
-    be_stackpop(vm, 2)  # pop strtab
-    scan_next_token(parser)  # clear lexer
+    try:
+        # Push closure on stack for GC protection
+        if vm.top_idx >= len(vm.stack):
+            vm.stack.append(bvalue())
+        var_setclosure(vm.stack[vm.top_idx], cl)
+        be_stackpush(vm)
+
+        be_lexer_init(parser.lexer, vm, fname, reader, data)
+        scan_next_token(parser)  # scan first token
+        mainfunc(parser, cl)
+        be_lexer_deinit(parser.lexer)
+        be_global_release_space(vm)
+        be_stackpop(vm, 2)  # pop strtab
+        scan_next_token(parser)  # clear lexer
+    finally:
+        if _prev_recursion_limit < _needed:
+            sys.setrecursionlimit(_prev_recursion_limit)
     return cl

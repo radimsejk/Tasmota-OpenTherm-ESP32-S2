@@ -21,6 +21,10 @@ extern "C" {
 extern struct rst_info resetInfo;
 }
 
+#ifdef ESP32 // ESP32 specific gpio driver defines
+#include "driver/gpio.h"
+#endif // ESP32
+
 /*********************************************************************************************\
  * ESP32 Watchdog
 \*********************************************************************************************/
@@ -1723,7 +1727,7 @@ void TemplateGpios(myio *gp)
     j++;
 #endif  // ESP8266
 #ifdef ESP32
-#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32P4
+#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61 || CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
     dest[i] = src[i];
 #elif CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3
     if (22 == i) { j = 33; }    // skip 22-32
@@ -1799,10 +1803,15 @@ bool FlashPin(uint32_t pin) {
   return ((pin > 15) && (pin < 23));   // ESP32C5 has GPIOs 16-22 reserved for Flash
 #elif CONFIG_IDF_TARGET_ESP32C6
   return ((pin == 24) || (pin == 25) || (pin == 27) || (pin == 29) || (pin == 30));  // ESP32C6 has GPIOs 24-30 reserved for Flash, with some boards GPIOs 26 28 are useable
+#elif CONFIG_IDF_TARGET_ESP32C61
+  return ((pin >= 14) && (pin <= 21)); // ESP32C61 has GPIOs 14-21 reserved for Flash/PSRAM
 #elif CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3
   return (pin > 21) && (pin < 33);     // ESP32S2 skip 22-32
 #elif CONFIG_IDF_TARGET_ESP32P4
   return false;                        // ESP32P4 has no flash pins, but GPIOs 34-38 are strapping pins
+#elif CONFIG_IDF_TARGET_ESP32S31
+  return ((pin >= 26) && (pin <= 28)) ||
+         ((pin >= 30) && (pin <= 32)); // SPI flash pins; GPIO29 is unbonded
 #else
   return (pin >= 28) && (pin <= 31);   // ESP32 skip 28-31
 #endif  // ESP32C2/C3/C5/C6 and S2/S3
@@ -1822,10 +1831,14 @@ bool RedPin(uint32_t pin) {            // Pin may be dangerous to change, displa
   return (2 == pin) || (7 == pin) || (25 == pin) || (27 == pin) || (28 == pin);  // ESP32C5: GPIO2,7,25,27,28 are strapping pins
 #elif CONFIG_IDF_TARGET_ESP32C6
   return (26 == pin) || (28 == pin);   // ESP32C6: GPIOs 26 28 are usually used for Flash (mode QIO/QOUT)
+#elif CONFIG_IDF_TARGET_ESP32C61
+  return (0 == pin) || (2 == pin) || (3 == pin) || (4 == pin) || (7 == pin) || (8 == pin) || (9 == pin);  // ESP32C61: GPIO0,2,3,4,7,8,9 are strapping pins
 #elif CONFIG_IDF_TARGET_ESP32S2
   return false;                        // No red pin on ESP32S3
 #elif  CONFIG_IDF_TARGET_ESP32P4
   return (34 >= pin) && (38 <= pin);   // strapping pins on ESP32P4
+#elif CONFIG_IDF_TARGET_ESP32S31
+  return false;
 #elif CONFIG_IDF_TARGET_ESP32S3
   return (33 <= pin) && (37 >= pin);   // ESP32S3: GPIOs 33..37 are usually used for PSRAM
 #else   // ESP32 red pins are 6-11 for original ESP32, other models like PICO are not impacted if flash pins are condfigured
@@ -1836,6 +1849,11 @@ bool RedPin(uint32_t pin) {            // Pin may be dangerous to change, displa
 }
 
 uint32_t ValidPin(uint32_t pin, uint32_t gpio, uint8_t isTuya = false) {
+#if CONFIG_IDF_TARGET_ESP32S31
+  if (!GPIO_IS_VALID_GPIO(pin)) {
+    return GPIO_NONE;
+  }
+#endif
   if (FlashPin(pin)) {
     return GPIO_NONE;    // Disable flash pins GPIO6, GPIO7, GPIO8 and GPIO11
   }
@@ -2175,8 +2193,18 @@ void SetSerialSwap(void) {
 }
 #endif
 
+void SetTasmotaGlobalBaudrate(uint32_t baudrate) {
+  TasmotaGlobal.baudrate = baudrate;
+  if (Settings != nullptr) {              // May not have been initialized yet
+    Settings->baudrate = TasmotaGlobal.baudrate / 300;
+  }
+  if (74700 == TasmotaGlobal.baudrate) {  // 74880 / 300 = 249,6. 249 * 300 = 74700
+    TasmotaGlobal.baudrate = 74880;       // ESP8266 ROM baudrate
+  }
+}
+
 void SetSerialBegin(void) {
-  TasmotaGlobal.baudrate = Settings->baudrate * 300;
+  SetTasmotaGlobalBaudrate(Settings->baudrate * 300);
   AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_SERIAL "Set to %s %d bit/s"), GetSerialConfig().c_str(), TasmotaGlobal.baudrate);
   Serial.flush();
 #ifdef ESP8266
@@ -2199,7 +2227,7 @@ void SetSerialBegin(void) {
 }
 
 void SetSerialInitBegin(void) {
-  TasmotaGlobal.baudrate = Settings->baudrate * 300;
+  SetTasmotaGlobalBaudrate(Settings->baudrate * 300);
   if ((GetSerialBaudrate() != TasmotaGlobal.baudrate) || (TS_SERIAL_8N1 != Settings->serial_config)) {
     SetSerialBegin();
   }
@@ -2216,8 +2244,7 @@ void SetSerialConfig(uint32_t serial_config) {
 }
 
 void SetSerialBaudrate(uint32_t baudrate) {
-  TasmotaGlobal.baudrate = baudrate;
-  Settings->baudrate = TasmotaGlobal.baudrate / 300;
+  SetTasmotaGlobalBaudrate(baudrate);
   if (GetSerialBaudrate() != TasmotaGlobal.baudrate) {
     SetSerialBegin();
   }
@@ -2226,15 +2253,14 @@ void SetSerialBaudrate(uint32_t baudrate) {
 void SetSerial(uint32_t baudrate, uint32_t serial_config) {
   Settings->flag.mqtt_serial = 0;  // CMND_SERIALSEND and CMND_SERIALLOG
   Settings->serial_config = serial_config;
-  TasmotaGlobal.baudrate = baudrate;
-  Settings->baudrate = TasmotaGlobal.baudrate / 300;
+  SetTasmotaGlobalBaudrate(baudrate);
   SetSeriallog(LOG_LEVEL_NONE);
   SetSerialBegin();
 }
 
 void ClaimSerial(void) {
 #ifdef ESP32
-#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3
+#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32S31
 #ifdef USE_USB_CDC_CONSOLE
   if (!tasconsole_serial) {
     return;              // USB console does not use serial
@@ -2245,8 +2271,7 @@ void ClaimSerial(void) {
   TasmotaGlobal.serial_local = true;
   AddLog(LOG_LEVEL_INFO, PSTR("SNS: Hardware Serial"));
   SetSeriallog(LOG_LEVEL_NONE);
-  TasmotaGlobal.baudrate = GetSerialBaudrate();
-  Settings->baudrate = TasmotaGlobal.baudrate / 300;
+  SetTasmotaGlobalBaudrate(GetSerialBaudrate());
 }
 
 void SerialSendRaw(char *codes)
@@ -2811,12 +2836,16 @@ void AddLogData(uint32_t loglevel, const char* log_data, const char* log_data_pa
 #ifdef ESP8266
     snprintf_P(mxtime, sizeof(mxtime), PSTR("%s-%03d"),
       mxtime, ESP_getFreeHeap1024());
-#else
+#ifdef USE_ESP8266_DEBUG_HEAP
+    snprintf_P(mxtime, sizeof(mxtime), PSTR("%s/%02d"),
+      mxtime, ESP_getHeapFragmentation());
+#endif  // USE_ESP8266_DEBUG_HEAP
+#else   // ESP32
     snprintf_P(mxtime, sizeof(mxtime), PSTR("%s-%03d/%02d"),
       mxtime, ESP_getFreeHeap1024(), ESP_getHeapFragmentation());
-#endif
+#endif  // ESP8266 or ESP32
   }
-  strcat(mxtime, " ");
+  strlcat(mxtime, " ", sizeof(mxtime));
 
   char empty[2] = { 0 };
   if (!log_data_payload) { log_data_payload = empty; }
@@ -2842,8 +2871,10 @@ void AddLogData(uint32_t loglevel, const char* log_data, const char* log_data_pa
     uint32_t log_data_len = strlen(log_data) + strlen(log_data_payload) + strlen(log_data_retained);
     if (log_data_len > MAX_LOGSZ) {
       too_long = (char*)malloc(TOPSZ);     // Use heap in favour of stack
+      if (too_long == nullptr) { return; }  // Drop the log without touching the existing buffer.
       snprintf_P(too_long, TOPSZ - 20, PSTR("%s%s"), log_data, log_data_payload);   // 20 = strlen("... 123456 truncated")
-      snprintf_P(too_long, TOPSZ, PSTR("%s... %d truncated"), too_long, log_data_len);
+      size_t prefix_len = strlen(too_long);
+      snprintf_P(too_long + prefix_len, TOPSZ - prefix_len, PSTR("... %d truncated"), log_data_len);
       log_data = too_long;
       log_data_payload = empty;
       log_data_retained = empty;
@@ -2911,6 +2942,7 @@ void AddLog(uint32_t loglevel, PGM_P formatP, ...) {
     return;
   }
 #endif
+  if (!loglevel) return; // loglevel == 0 -> nothing to log
   uint32_t highest_loglevel = HighestLogLevel();
   // If no logging is requested then do not access heap to fight fragmentation
   if ((loglevel <= highest_loglevel) && (TasmotaGlobal.masterlog_level <= highest_loglevel)) {
@@ -2965,6 +2997,45 @@ String HtmlEscape(const String unescaped) {
 
 String SettingsTextEscaped(uint32_t index) {
   return HtmlEscape(SettingsText(index));
+}
+// Truncate src to max UTF-8 codepoints with optional max visual width.
+// max_codepoints limits codepoints (0 = no limit)
+// max_width limits *approximated* visual width (0 = no limit):
+//    narrow chars (1-2 byte: ASCII, Latin, Cyrillic) approximated to cost 1 width unit
+//    wide chars (3-4 byte: CJK, emoji) approximated to cost 2 width units
+// Multi-byte characters are never split mid-sequence
+// ZWJ sequences and skin tone modifiers are not recognized as single glyphs and may be split
+String Utf8Truncate(const char *src, uint32_t max_codepoints, uint32_t max_width = 0) {
+  if (!src) { return String(); }
+  if (!max_codepoints && !max_width) {
+    return String(src);
+  }
+  size_t slen = strlen(src);
+  size_t bytes = 0;
+  size_t width = 0;
+  size_t chars = 0;
+  while (bytes < slen) {
+    if (max_codepoints && chars >= max_codepoints) { break; }
+    uint8_t lead = (uint8_t)src[bytes];
+    size_t clen = 1;
+    if      (lead >= 0xF0 && lead <= 0xF4) { clen = 4; }   // valid 4-byte lead
+    else if (lead >= 0xE0)                 { clen = 3; }   // 3-byte lead
+    else if (lead >= 0xC2)                 { clen = 2; }   // 2-byte lead (skip overlong 0xC0/0xC1)
+    // else: ASCII or stray continuation byte -> treat as 1 byte
+    if (bytes + clen > slen) { break; }
+    size_t cwidth = (clen >= 3) ? 2 : 1;
+    if (max_width && (width + cwidth > max_width)) { break; }
+    bytes += clen;
+    width += cwidth;
+    chars++;
+  }
+  if (!bytes) {
+    return String();
+  }
+  String result;
+  result.reserve(bytes);
+  result.concat(src, bytes);
+  return result;
 }
 
 String UrlEscape(const char *unescaped) {

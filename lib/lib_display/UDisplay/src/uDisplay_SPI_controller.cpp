@@ -9,7 +9,24 @@
 #define GPIO_SET_SLOW(A) digitalWrite(A, HIGH)
 #define GPIO_CLR_SLOW(A) digitalWrite(A, LOW)
 #else // ESP32
-#if CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32P4
+#if CONFIG_IDF_TARGET_ESP32S31
+static inline void uDisplayGpioClear(uint32_t pin) {
+  if (pin < 32) {
+    GPIO.out_w1tc.val = (1U << pin);
+  } else {
+    GPIO.out1_w1tc.val = (1U << (pin - 32));
+  }
+}
+static inline void uDisplayGpioSet(uint32_t pin) {
+  if (pin < 32) {
+    GPIO.out_w1ts.val = (1U << pin);
+  } else {
+    GPIO.out1_w1ts.val = (1U << (pin - 32));
+  }
+}
+#define GPIO_CLR(A) uDisplayGpioClear(A)
+#define GPIO_SET(A) uDisplayGpioSet(A)
+#elif CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61 || CONFIG_IDF_TARGET_ESP32P4
 #define GPIO_CLR(A) GPIO.out_w1tc.val = (1 << A)
 #define GPIO_SET(A) GPIO.out_w1ts.val = (1 << A)
 #else // plain ESP32 or S3
@@ -272,12 +289,16 @@ void SPIController::hw_write9(uint8_t val, uint8_t dc) {
         else regvalue &= 0x7f;
         if (val & 1) regvalue |= 0x8000;
 
-        REG_SET_BIT(SPI_USER_REG(3), SPI_USR_MOSI);
-        REG_WRITE(SPI_MOSI_DLEN_REG(3), 9 - 1);
-        uint32_t *dp = (uint32_t*)SPI_W0_REG(3);
+        uint8_t spi_index = 3;
+#if CONFIG_IDF_TARGET_ESP32S31
+        if (spi_config.bus_nr == 1) spi_index = 2;
+#endif
+        REG_SET_BIT(SPI_USER_REG(spi_index), SPI_USR_MOSI);
+        REG_WRITE(SPI_MOSI_DLEN_REG(spi_index), 9 - 1);
+        uint32_t *dp = (uint32_t*)SPI_W0_REG(spi_index);
         *dp = regvalue;
-        REG_SET_BIT(SPI_CMD_REG(3), SPI_USR);
-        while (REG_GET_FIELD(SPI_CMD_REG(3), SPI_USR));
+        REG_SET_BIT(SPI_CMD_REG(spi_index), SPI_USR);
+        while (REG_GET_FIELD(SPI_CMD_REG(spi_index), SPI_USR));
     }
 }
 #else
@@ -311,16 +332,19 @@ void SPIController::hw_write9(uint8_t val, uint8_t dc) {
 // DMA
 #ifdef ESP32
 bool SPIController::initDMA(uint16_t width, uint16_t flushlines, uint8_t data) {
-    AddLog(3,"init dma %u %u %d",flushlines,data, spi_config.cs);
+    AddLog(3,"DSP: init dma %u %u %d",flushlines,data, spi_config.cs);
     if (!spi && spi_config.cs == -1) return false;
     if((data&1) == 0){
-        AddLog(3,"no dma selected");
+        AddLog(3,"DSP: no dma selected");
         return false;
     }
     if (spi_config.bus_nr == 1){
-        AddLog(3,"dma spi 1");
+        AddLog(3,"DSP: dma spi 1");
+#if CONFIG_IDF_TARGET_ESP32S31
+        spi_host = FSPI_HOST;
+#endif
     } else if (spi_config.bus_nr == 2){
-        AddLog(3,"dma spi 2");
+        AddLog(3,"DSP: dma spi 2");
         spi_host = HSPI_HOST;
     } else {
         return false;
@@ -361,11 +385,11 @@ bool SPIController::initDMA(uint16_t width, uint16_t flushlines, uint8_t data) {
 
     ret = spi_bus_initialize(spi_host, &buscfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        AddLog(3,"init dma bus init failed: %d", ret);
+        AddLog(3,"DSP: init dma bus init failed: %d", ret);
         return false;
     }
     if (ret == ESP_ERR_INVALID_STATE) {
-        AddLog(3,"init dma bus already initialized (OK)");
+        AddLog(3,"DSP: init dma bus already initialized (OK)");
     }
     
     ret = spi_bus_add_device(spi_host, &devcfg, &dmaHAL);
@@ -374,7 +398,7 @@ bool SPIController::initDMA(uint16_t width, uint16_t flushlines, uint8_t data) {
         async_dma_enabled = ((data&4) != 0);
         dma_enabled = true;
         spiBusyCheck = 0;
-        AddLog(3,"init dma succes");
+        AddLog(3,"DSP: init dma succes");
         return true;
     }
     return false;

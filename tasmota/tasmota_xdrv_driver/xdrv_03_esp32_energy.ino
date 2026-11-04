@@ -1017,7 +1017,11 @@ void ResponseCmndEnergyTotalYesterdayToday(void) {
   if (Energy->local_energy_active_export) {
     ResponseAppend_P(PSTR(",\"" D_JSON_EXPORT_ACTIVE "\":%s"),
       EnergyFmt(Energy->export_active, Settings->flag2.energy_resolution));
-  }
+    if (Energy->phase_count > 1 && !Settings->flag5.energy_phase) {
+      ResponseAppend_P(PSTR(",\"" D_JSON_EXPORT_ACTIVE_TOTAL "\":%s"),
+      EnergyFmt(Energy->export_active, Settings->flag2.energy_resolution, 2));
+    }
+  }  
   ResponseJsonEndEnd();
   EnergyFmtFree();
 }
@@ -1650,12 +1654,18 @@ void EnergyShow(bool json) {
   }
 
   float energy_yesterday_kWh[Energy->phase_count];
+  float energy_total_sum = 0.0f;
   float active_power_sum = 0.0f;
   int negative_phases = 0;
   for (uint32_t i = 0; i < Energy->phase_count; i++) {
     energy_yesterday_kWh[i] = Energy->Settings.energy_yesterday_kWh[i];
-    active_power_sum += Energy->active_power[i];
-    negative_phases += (Energy->active_power[i] < 0) ? -1 : 1;
+    if (!isnan(Energy->total[i])) {
+      energy_total_sum += Energy->total[i];
+    }
+    if (!isnan(Energy->active_power[i])) {
+      active_power_sum += Energy->active_power[i];
+      negative_phases += (Energy->active_power[i] < 0) ? -1 : 1;
+    }
   }
 
   bool energy_tariff = false;
@@ -1707,6 +1717,10 @@ void EnergyShow(bool json) {
         EnergyFmt(&Energy->daily_sum_export_balanced, Settings->flag2.energy_resolution, 1));
       ResponseAppend_P(PSTR(",\"" D_JSON_EXPORT_ACTIVE "\":%s"),
         EnergyFmt(Energy->export_active, Settings->flag2.energy_resolution, single));
+      if (Energy->phase_count > 1 && !Settings->flag5.energy_phase) {
+       ResponseAppend_P(PSTR(",\"" D_JSON_EXPORT_ACTIVE_TOTAL "\":%s"),
+          EnergyFmt(Energy->export_active, Settings->flag2.energy_resolution, 2));
+      }
       if (energy_tariff) {
         ResponseAppend_P(PSTR(",\"" D_JSON_EXPORT D_CMND_TARIFF "\":%s"),
           EnergyFmt(energy_return_kWh, Settings->flag2.energy_resolution, 6));
@@ -1725,6 +1739,10 @@ void EnergyShow(bool json) {
 
     ResponseAppend_P(PSTR(",\"" D_JSON_POWERUSAGE "\":%s"),
         EnergyFmt(Energy->active_power, Settings->flag2.wattage_resolution));
+    if (Energy->phase_count > 1 && !Settings->flag5.energy_phase) {
+      ResponseAppend_P(PSTR(",\"" D_JSON_POWERUSAGE_TOTAL "\":%s"),
+          EnergyFmt(Energy->active_power, Settings->flag2.wattage_resolution, 2));
+    }
     if (!Energy->type_dc) {
       if (Energy->current_available && Energy->voltage_available) {
         ResponseAppend_P(PSTR(",\"" D_JSON_APPARENT_POWERUSAGE "\":%s"),
@@ -1761,7 +1779,7 @@ void EnergyShow(bool json) {
         dtostrfd(Energy->current[0], Settings->flag2.current_resolution, temp_chr);
         DomoticzSensor(DZ_CURRENT, temp_chr);  // Current
       }
-      dtostrfd(Energy->total_sum * 1000, 1, temp_chr);
+      dtostrfd(energy_total_sum * 1000, 1, temp_chr);
       DomoticzSensorPowerEnergy((int)active_power_sum, temp_chr);  // PowerUsage, EnergyToday
 
       char energy_usage_chr[2][FLOATSZ];
@@ -1787,7 +1805,7 @@ void EnergyShow(bool json) {
         KnxSensor(KNX_ENERGY_POWERFACTOR, power_factor[0]);
       }
       KnxSensor(KNX_ENERGY_DAILY, Energy->daily_sum);
-      KnxSensor(KNX_ENERGY_TOTAL, Energy->total_sum);
+      KnxSensor(KNX_ENERGY_TOTAL, energy_total_sum);
       KnxSensor(KNX_ENERGY_YESTERDAY, Energy->yesterday_sum);
     }
 #endif  // USE_KNX
